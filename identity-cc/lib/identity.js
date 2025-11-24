@@ -213,19 +213,29 @@ class IdentityContract extends Contract {
     }
 
     /**
-     * VerifyAge(ctx, userID, minimumAge, proofJSON, publicSignalsJSON)
-     * minimumAge: stringified integer (e.g. "18")
-     * publicSignals are expected to follow: [minimumAge, credentialHash, isOfAgeFlag, ...]
+     * VerifyAge(ctx, userID, minimumAge, proofJSON, publicSignalsJSON, rootHash)
+     * 
+     * Updated to include Merkle tree binding:
+     * - Verifies ZK proof using snarkjs (proof that user is of age)
+     * - Verifies rootHash matches on-chain credentialHash (proof is bound to issued credential)
+     * 
+     * @param {string} userID - User identifier
+     * @param {string} minimumAge - Minimum age threshold
+     * @param {string} proofJSON - Groth16 proof JSON
+     * @param {string} publicSignalsJSON - Public signals from circuit (should contain [isAdult])
+     * @param {string} rootHash - Merkle root hash of user's credential fields
      */
-    async VerifyAge(ctx, userID, minimumAge, proofJSON, publicSignalsJSON) {
+    async VerifyAge(ctx, userID, minimumAge, proofJSON, publicSignalsJSON, rootHash) {
         if (!userID) throw new Error('userID is required');
+        if (!rootHash) throw new Error('rootHash is required');
 
-        // Verify the proof
+        // Step 1: Verify the ZK proof using snarkjs
         const { valid, publicSignals } = await verifyGroth16Payload(proofJSON, publicSignalsJSON);
         if (!valid) {
             throw new Error('Proof verification failed');
         }
 
+        // Step 2: Extract and validate isAdult flag from public signals
         // For the simple age_check circuit, we expect a single public output: [isAdult]
         // isAdult should be "1"
         if (!Array.isArray(publicSignals) || publicSignals.length === 0) {
@@ -237,6 +247,53 @@ class IdentityContract extends Contract {
             throw new Error('Proof indicates the holder is NOT an adult (isAdult != 1)');
         }
 
+        // Step 3: Retrieve on-chain credential to get stored credentialHash
+        const credentialData = await this.GetCredential(ctx, userID);
+        const credential = JSON.parse(credentialData);
+
+        // Ensure credential is valid (not revoked)
+        if (!credential.valid) {
+            throw new Error(`Credential for user ${userID} has been revoked`);
+        }
+
+        // Step 4: Verify that provided rootHash matches on-chain credentialHash
+        // This binds the proof to the specific credential issued on-chain
+        const onChainHash = credential.credentialHash;
+
+        // Normalize both hashes for comparison (remove 0x prefix if present, compare as strings)
+        const normalizeHash = (hash) => {
+            if (typeof hash === 'string') {
+                return hash.toLowerCase().replace(/^0x/, '');
+            }
+            return String(hash);
+        };
+
+        const normalizedRootHash = normalizeHash(rootHash);
+        const normalizedOnChainHash = normalizeHash(onChainHash);
+
+        if (normalizedRootHash !== normalizedOnChainHash) {
+            throw new Error(
+                `Proof rootHash does not match on-chain credential. ` +
+                `Expected: ${normalizedOnChainHash}, Got: ${normalizedRootHash}`
+            );
+        }
+
+        // CRITICAL SECURITY CHECK:
+        // Ensure the root hash OUTPUT by the circuit (publicSignals[1]) matches the rootHash we just verified against storage.
+        // Without this, a user could provide a valid proof for a DIFFERENT root hash (fake credential)
+        // and just pass the correct root hash as an argument to bypass the storage check.
+        if (publicSignals.length < 2) {
+            throw new Error('Public signals must contain rootHash at index 1');
+        }
+        const circuitRootHash = normalizeHash(publicSignals[1]);
+        if (circuitRootHash !== normalizedRootHash) {
+            throw new Error(
+                `Circuit output rootHash does not match provided rootHash. ` +
+                `Circuit: ${circuitRootHash}, Provided: ${normalizedRootHash}`
+            );
+        }
+
+        // Step 5: All checks passed - record successful verification
         const verificationKey = ctx.stub.createCompositeKey('ageVerification', [userID, ctx.stub.getTxID()]);
         const record = {
             userID,
@@ -244,13 +301,14 @@ class IdentityContract extends Contract {
             timestamp: new Date((ctx.stub.getTxTimestamp().seconds.low * 1000)).toISOString(),
             minimumAge: minimumAge || 18, // Default to 18 as per circuit
             isOfAge: true,
-            publicSignals
+            publicSignals,
+            rootHashVerified: true // New field indicating rootHash was checked
         };
 
         await ctx.stub.putState(verificationKey, Buffer.from(JSON.stringify(record)));
         await ctx.stub.setEvent('VerifyAge', Buffer.from(JSON.stringify({ userID, isOfAge: true })));
 
-        return JSON.stringify({ valid: true, isOfAge: true });
+        return JSON.stringify({ valid: true, isOfAge: true, rootHashVerified: true });
     }
 
     // Helper: Query all verifications (optional)
