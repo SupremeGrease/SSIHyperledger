@@ -1,0 +1,14 @@
+{
+  "name": "identitycc",
+  "version": "1.0.0",
+  "description": "Identity Chaincode",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "fabric-contract-api": "^2.5.0",
+    "fabric-shim": "^2.5.0",
+    "snarkjs": "^0.7.0"
+  }
+}
