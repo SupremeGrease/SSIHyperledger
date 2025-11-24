@@ -87,11 +87,17 @@ async function verifyGroth16Payload(proofJSON, publicSignalsJSON) {
     const vKey = await getVerificationKey();
 
     try {
+        console.log('DEBUG: vKey keys:', Object.keys(vKey));
+        if (vKey.IC) console.log('DEBUG: vKey.IC length:', vKey.IC.length);
+        console.log('DEBUG: publicSignals:', JSON.stringify(publicSignals));
+        console.log('DEBUG: proof keys:', Object.keys(proof));
+
         const valid = await snarkjs.groth16.verify(vKey, publicSignals, proof);
         return { valid, publicSignals };
     } catch (err) {
         const errMsg = `snarkjs verification failed: ${err.message || err}`;
         console.error(errMsg);
+        console.error(err.stack);
         throw new Error(errMsg);
     }
 }
@@ -141,7 +147,7 @@ class IdentityContract extends Contract {
         const data = {
             credentialHash,
             issuer: issuer || 'unknown',
-            timestamp: timestamp || new Date().toISOString(),
+            timestamp: timestamp || new Date((ctx.stub.getTxTimestamp().seconds.low * 1000)).toISOString(),
             valid: true
         };
 
@@ -174,7 +180,7 @@ class IdentityContract extends Contract {
 
         const obj = JSON.parse(b.toString());
         obj.valid = false;
-        obj.revokedAt = new Date().toISOString();
+        obj.revokedAt = new Date((ctx.stub.getTxTimestamp().seconds.low * 1000)).toISOString();
         if (reason) obj.revocationReason = reason;
 
         await ctx.stub.putState(key, Buffer.from(JSON.stringify(obj)));
@@ -195,7 +201,7 @@ class IdentityContract extends Contract {
         const record = {
             userID,
             txID: ctx.stub.getTxID(),
-            timestamp: new Date().toISOString(),
+            timestamp: new Date((ctx.stub.getTxTimestamp().seconds.low * 1000)).toISOString(),
             valid,
             publicSignals
         };
@@ -213,62 +219,54 @@ class IdentityContract extends Contract {
      */
     async VerifyAge(ctx, userID, minimumAge, proofJSON, publicSignalsJSON) {
         if (!userID) throw new Error('userID is required');
-        if (!minimumAge) throw new Error('minimumAge is required');
 
-        const minAgeInt = parseInt(minimumAge, 10);
-        if (Number.isNaN(minAgeInt) || minAgeInt <= 0) {
-            throw new Error('minimumAge must be a positive integer');
-        }
-
+        // Verify the proof
         const { valid, publicSignals } = await verifyGroth16Payload(proofJSON, publicSignalsJSON);
         if (!valid) {
             throw new Error('Proof verification failed');
         }
 
-        if (!Array.isArray(publicSignals) || publicSignals.length < 3) {
-            throw new Error('Public signals must include at least [minimumAge, credentialHash, isOfAgeFlag]');
+        // For the simple age_check circuit, we expect a single public output: [isAdult]
+        // isAdult should be "1"
+        if (!Array.isArray(publicSignals) || publicSignals.length === 0) {
+            throw new Error('Public signals empty');
         }
 
-        const circuitMinAge = toNumber(publicSignals[0]);
-        if (Number.isNaN(circuitMinAge)) {
-            throw new Error('Circuit minimum age signal could not be parsed');
-        }
-
-        if (circuitMinAge !== minAgeInt) {
-            throw new Error(`Circuit minimum age (${circuitMinAge}) does not match requested minimum age (${minAgeInt})`);
-        }
-
-        const isOfAgeFlag = toBooleanSignal(publicSignals[2]);
-        if (!isOfAgeFlag) {
-            throw new Error('Proof indicates the holder does not meet the minimum age requirement');
+        const isAdult = publicSignals[0];
+        if (isAdult !== '1') {
+            throw new Error('Proof indicates the holder is NOT an adult (isAdult != 1)');
         }
 
         const verificationKey = ctx.stub.createCompositeKey('ageVerification', [userID, ctx.stub.getTxID()]);
         const record = {
             userID,
             txID: ctx.stub.getTxID(),
-            timestamp: new Date().toISOString(),
-            minimumAge: minAgeInt,
-            credentialHash: publicSignals[1],
+            timestamp: new Date((ctx.stub.getTxTimestamp().seconds.low * 1000)).toISOString(),
+            minimumAge: minimumAge || 18, // Default to 18 as per circuit
             isOfAge: true,
             publicSignals
         };
 
         await ctx.stub.putState(verificationKey, Buffer.from(JSON.stringify(record)));
-        await ctx.stub.setEvent('VerifyAge', Buffer.from(JSON.stringify({ userID, minimumAge: minAgeInt })));
+        await ctx.stub.setEvent('VerifyAge', Buffer.from(JSON.stringify({ userID, isOfAge: true })));
 
-        return JSON.stringify({ valid: true, minimumAge: minAgeInt });
+        return JSON.stringify({ valid: true, isOfAge: true });
     }
 
     // Helper: Query all verifications (optional)
     async QueryVerifications(ctx) {
         const iterator = await ctx.stub.getStateByPartialCompositeKey('verification', []);
         const results = [];
-        for await (const res of iterator) {
-            if (res.value && res.value.toString()) {
-                results.push(JSON.parse(res.value.toString('utf8')));
+
+        let res = await iterator.next();
+        while (!res.done) {
+            if (res.value && res.value.value) {
+                results.push(JSON.parse(res.value.value.toString('utf8')));
             }
+            res = await iterator.next();
         }
+        await iterator.close();
+
         return JSON.stringify(results);
     }
 

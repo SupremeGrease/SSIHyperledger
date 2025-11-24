@@ -4,7 +4,7 @@
   "description": "Identity Chaincode",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js"
+    "start": "fabric-chaincode-node start"
   },
   "dependencies": {
     "fabric-contract-api": "^2.5.0",
